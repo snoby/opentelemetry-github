@@ -129,7 +129,9 @@ cache_restore_toolkit() {
 cache_save_toolkit() {
   sudo_e -H node --input-type=module -e "try { const cache = await import('@actions/cache'); await cache.saveCache(['/var/cache/apt/archives/*.deb', '/root/.cache/pip', '/root/.cache/uv', '/var/cache/opentelemetry_shell/wheels/*.whl'], '$cache_key'); } catch { console.log('::debug::Dependency cache save was unavailable.'); }"
 }
-run npm --no-audit ci
+if [ ! -d node_modules/@actions/artifact ]; then # LAB PATCH: synchronous npm ci - artifact upload depends on it
+  npm --no-audit ci || echo "::warning::npm ci failed - artifact-based trace coordination will degrade to local trace ids" >&2
+fi
 if [ "$INPUT_CACHE" = "true" ]; then
   echo "::debug::Resolving cache ..."
   export INSTRUMENTATION_CACHE_KEY="${GITHUB_ACTION_REPOSITORY} ${action_tag_name} instrumentation $GITHUB_WORKFLOW $GITHUB_JOB"
@@ -175,7 +177,9 @@ if ! type otel.sh && [ -n "$deb_file" ] && [ -r "$deb_file" ]; then
   fi
 fi
 bash -e -o pipefail ../shared/install.sh perl curl wget jq sed unzip parallel 'node;nodejs' npm 'gcc;build-essential'
-if ! type otelcol-contrib; then
+if [ "${OTEL_SHELL_SKIP_LOCAL_COLLECTOR:-FALSE}" = "TRUE" ]; then # LAB PATCH: export direct to in-cluster collector; skip ~80MB otelcol download
+  echo "::notice::Skipping local otelcol-contrib (direct OTLP export enabled)"
+elif ! type otelcol-contrib; then
   if ! [ -r /var/cache/apt/archives/otelcol-contrib.deb ]; then
     GITHUB_REPOSITORY=open-telemetry/opentelemetry-collector-releases gh_release v"$(cat Dockerfile | grep '^FROM ' | cut -d ' ' -f 2- | cut -d : -f 2)" | jq '.assets[] | select(.name | endswith(".deb")) | [ .name, .url ] | @tsv' -r | grep contrib | grep linux | grep "$(arch | sed 's/x86_64/amd64/g' | sed 's/aarch64/arm64/g' | sed 's/le$/el/g')" | head -n 1 | cut -d $'\t' -f 2 |
       xargs -I '{}' wget -q --header "Authorization: Bearer $INPUT_GITHUB_TOKEN" --header "Accept: application/octet-stream" '{}' -O - | sudo tee /var/cache/apt/archives/otelcol-contrib.deb >/dev/null
@@ -335,6 +339,7 @@ if type yq; then
   done
 fi
 if [ -n "$INPUT_DEBUG" ]; then cat collector.yml; fi
+if [ "${OTEL_SHELL_SKIP_LOCAL_COLLECTOR:-FALSE}" != "TRUE" ]; then # LAB PATCH: keep real endpoints when exporting direct
 export OTEL_LOGS_EXPORTER=otlp
 export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://localhost:4318/v1/logs
 export OTEL_EXPORTER_OTLP_LOGS_PROTOCOL=http/protobuf
@@ -345,6 +350,11 @@ export OTEL_TRACES_EXPORTER=otlp
 export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:4318/v1/traces
 export OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf
 unset OTEL_EXPORTER_OTLP_HEADERS OTEL_EXPORTER_OTLP_ENDPOINT OTEL_EXPORTER_OTLP_LOGS_HEADERS OTEL_EXPORTER_OTLP_METRICS_HEADERS OTEL_EXPORTER_OTLP_TRACES_HEADERS
+else
+export OTEL_LOGS_EXPORTER=${OTEL_LOGS_EXPORTER:-otlp}
+export OTEL_METRICS_EXPORTER=${OTEL_METRICS_EXPORTER:-otlp}
+export OTEL_TRACES_EXPORTER=${OTEL_TRACES_EXPORTER:-otlp}
+fi
 echo "::endgroup::"
 
 echo "::group::Instrument shell/javascript/docker actions"
@@ -614,8 +624,10 @@ root4job_end() {
   fi
   timeout 5s sh -c 'while fuser /opt/opentelemetry_shell/venv/bin/python; do sleep 1; done; true' &>/dev/null || echo "Found leaked SDK processes (this may be due to leaked processes that are still being observed)."
 
-  kill -SIGINT "$OTEL_COLLECTOR_PID" || INPUT_DEBUG=1
-  wait "$OTEL_COLLECTOR_PID"
+  if [ -n "$OTEL_COLLECTOR_PID" ]; then # LAB PATCH: only kill local collector when it exists
+    kill -SIGINT "$OTEL_COLLECTOR_PID" || INPUT_DEBUG=1
+    wait "$OTEL_COLLECTOR_PID"
+  fi
   local collector_pipe_warning="$(mktemp -u)"
   local collector_pipe_error="$(mktemp -u)"
   mkfifo "$collector_pipe_warning" "$collector_pipe_error"
@@ -637,9 +649,13 @@ root4job() {
   if [ -n "$INPUT_DEBUG" ]; then set -x; fi
   exec 1>/tmp/opentelemetry_shell.github.debug.log
   exec 2>/tmp/opentelemetry_shell.github.debug.log
-  export OTEL_GITHUB_COLLECTOR_CONFIG="$(cat collector.yml)"
-  otelcol-contrib --config=env:OTEL_GITHUB_COLLECTOR_CONFIG &>otelcol."$$".log &
-  OTEL_COLLECTOR_PID="$!"
+  if [ "${OTEL_SHELL_SKIP_LOCAL_COLLECTOR:-FALSE}" = "TRUE" ]; then # LAB PATCH: no local collector
+    OTEL_COLLECTOR_PID=""
+  else
+    export OTEL_GITHUB_COLLECTOR_CONFIG="$(cat collector.yml)"
+    otelcol-contrib --config=env:OTEL_GITHUB_COLLECTOR_CONFIG &>otelcol."$$".log &
+    OTEL_COLLECTOR_PID="$!"
+  fi
   rm -rf collector.yml 2>/dev/null
   rm /tmp/opentelemetry_shell.github.error 2>/dev/null
   traceparent_file="$1"
