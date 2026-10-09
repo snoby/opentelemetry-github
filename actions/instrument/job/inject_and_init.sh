@@ -129,8 +129,12 @@ cache_restore_toolkit() {
 cache_save_toolkit() {
   sudo_e -H node --input-type=module -e "try { const cache = await import('@actions/cache'); await cache.saveCache(['/var/cache/apt/archives/*.deb', '/root/.cache/pip', '/root/.cache/uv', '/var/cache/opentelemetry_shell/wheels/*.whl'], '$cache_key'); } catch { console.log('::debug::Dependency cache save was unavailable.'); }"
 }
-if [ ! -d node_modules/@actions/artifact ]; then # LAB PATCH: synchronous npm ci - artifact upload depends on it
-  npm --no-audit ci || echo "::warning::npm ci failed - artifact-based trace coordination will degrade to local trace ids" >&2
+if [ ! -d node_modules/@actions/artifact ]; then # LAB PATCH: prefer node_modules staged in the runner image (/opt/otel-action-node_modules), fall back to npm ci
+  if cp -a /opt/otel-action-node_modules ./node_modules 2>/dev/null && [ -d node_modules/@actions/artifact ]; then
+    echo "::debug::node_modules staged from runner image"
+  else
+    npm --no-audit ci || echo "::warning::npm ci failed - artifact-based trace coordination will degrade to local trace ids" >&2
+  fi
 fi
 if [ "$INPUT_CACHE" = "true" ]; then
   echo "::debug::Resolving cache ..."
