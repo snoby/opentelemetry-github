@@ -23,7 +23,13 @@ export -f gh_rate_limit
 gh_ensure_min_rate_limit_remaining() {
   local threshold="$1"
   local delay=1
+  local tries=0
   while [ "$(gh_rate_limit | jq '.resources.core | .remaining / .limit * 100 | floor')" -lt "$(echo "$threshold" | jq '. * 100 | floor')" ]; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 8 ]; then
+      echo "gh_ensure_min_rate_limit_remaining: gave up waiting for rate limit after $((delay))s x8 tries (shared org token) — continuing" >&2
+      return 0
+    fi
     sleep "$delay"
     local delay=$((delay * 2))
   done
