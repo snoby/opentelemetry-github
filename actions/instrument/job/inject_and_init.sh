@@ -388,15 +388,20 @@ count=0
 # LAB PATCH: bound the WHOLE loop (upstream precedence made [ count -lt N ] && ! dl || ! -r tp spin forever when
 # the artifact API is forbidden), and degrade gracefully: generate a local trace id if the artifact handshake
 # never converges (job spans then root at their own trace instead of failing the job).
-. otelapi.sh
-otel_init
+# LAB PATCH: traceparent generation without the OTel SDK (the SDK's fifo reader only starts later in
+# "Start Observation" - calling otelapi here deadlocks on the pipe). W3C format: 00-<32hex>-<16hex>-01.
+gen_traceparent() {
+  local t h
+  t=$(od -An -N16 -tx1 /dev/urandom | tr -d " \n")
+  h=$(od -An -N8 -tx1 /dev/urandom | tr -d " \n")
+  echo "00-$t-$h-01"
+}
 while [ ! -r "$opentelemetry_root_dir"/traceparent ] && [ "$count" -lt 6 ]; do
   gh_artifact_download "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" opentelemetry_workflow_run_"$GITHUB_RUN_ATTEMPT" "$opentelemetry_root_dir" || true
   if [ -r "$opentelemetry_root_dir"/traceparent ]; then break; fi
-  otel_span_traceparent "$(otel_span_start INTERNAL dummy)" >"$opentelemetry_root_dir"/traceparent
+  gen_traceparent >"$opentelemetry_root_dir"/traceparent
   gh_artifact_upload "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" opentelemetry_workflow_run_"$GITHUB_RUN_ATTEMPT" "$opentelemetry_root_dir"/traceparent || true
   rm -f "$opentelemetry_root_dir"/traceparent
-  otel_shutdown
   sleep 2
   count=$((count + 1))
 done
@@ -404,8 +409,7 @@ if [ -r "$opentelemetry_root_dir"/traceparent ]; then
   export TRACEPARENT="$(cat "$opentelemetry_root_dir"/traceparent)"
 else
   echo "::warning::Cannot sync trace id via artifacts (permission or availability issue) - using a locally generated trace id for this job." >&2
-  otel_init
-  otel_span_traceparent "$(otel_span_start INTERNAL dummy)" >"$opentelemetry_root_dir"/traceparent
+  gen_traceparent >"$opentelemetry_root_dir"/traceparent
   export TRACEPARENT="$(cat "$opentelemetry_root_dir"/traceparent)"
 fi
 rm -rf "$opentelemetry_root_dir"
