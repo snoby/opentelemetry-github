@@ -375,19 +375,29 @@ echo "::endgroup::"
 echo "::group::Resolve W3C Tracecontext"
 opentelemetry_root_dir="$(mktemp -d)"
 count=0
-while [ "$count" -lt 6 ] && ! gh_artifact_download "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" opentelemetry_workflow_run_"$GITHUB_RUN_ATTEMPT" "$opentelemetry_root_dir" || ! [ -r "$opentelemetry_root_dir"/traceparent ]; do
-  sleep 2 # LAB PATCH: constant short retry instead of triangular (1+2+..+59 ~ 29min)
-  wait # only join within this loop, because we need to make sure everything is installed properly at this point, in most cases, it is unnecessary though and we can join later
-  . otelapi.sh
-  otel_init
+# LAB PATCH: bound the WHOLE loop (upstream precedence made [ count -lt N ] && ! dl || ! -r tp spin forever when
+# the artifact API is forbidden), and degrade gracefully: generate a local trace id if the artifact handshake
+# never converges (job spans then root at their own trace instead of failing the job).
+. otelapi.sh
+otel_init
+while [ ! -r "$opentelemetry_root_dir"/traceparent ] && [ "$count" -lt 6 ]; do
+  gh_artifact_download "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" opentelemetry_workflow_run_"$GITHUB_RUN_ATTEMPT" "$opentelemetry_root_dir" || true
+  if [ -r "$opentelemetry_root_dir"/traceparent ]; then break; fi
   otel_span_traceparent "$(otel_span_start INTERNAL dummy)" >"$opentelemetry_root_dir"/traceparent
   gh_artifact_upload "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" opentelemetry_workflow_run_"$GITHUB_RUN_ATTEMPT" "$opentelemetry_root_dir"/traceparent || true
-  rm "$opentelemetry_root_dir"/traceparent
+  rm -f "$opentelemetry_root_dir"/traceparent
   otel_shutdown
+  sleep 2
   count=$((count + 1))
 done
-[ -r "$opentelemetry_root_dir"/traceparent ] || (echo "::error ::Cannot sync trace id via artifacts. This is most likely a token permission issue, please consult the README." && false)
-export TRACEPARENT="$(cat "$opentelemetry_root_dir"/traceparent)"
+if [ -r "$opentelemetry_root_dir"/traceparent ]; then
+  export TRACEPARENT="$(cat "$opentelemetry_root_dir"/traceparent)"
+else
+  echo "::warning::Cannot sync trace id via artifacts (permission or availability issue) - using a locally generated trace id for this job." >&2
+  otel_init
+  otel_span_traceparent "$(otel_span_start INTERNAL dummy)" >"$opentelemetry_root_dir"/traceparent
+  export TRACEPARENT="$(cat "$opentelemetry_root_dir"/traceparent)"
+fi
 rm -rf "$opentelemetry_root_dir"
 echo "::endgroup::"
 
