@@ -48,7 +48,12 @@ unset OTEL_SHELL_SPAN_KIND_OVERRIDE
 if \[ -p "$_otel_remote_sdk_pipe" ]; then
   otel_init() {
     _otel_mkfifo_flags="-m 666"
-    \eval "\\exec ${_otel_remote_sdk_fd}> \"$_otel_remote_sdk_pipe\""
+    # open the fifo read-write: a write-only open BLOCKS forever if the sdk
+    # reader died (kernel wait_for_partner — seen as 15min+ checkout hangs in
+    # CI). O_RDWR never blocks; a dead reader then surfaces as EPIPE/SIGPIPE
+    # on span writes, which we ignore so telemetry failure is fail-open.
+    \trap '' PIPE
+    \eval "\\exec ${_otel_remote_sdk_fd}<> \"$_otel_remote_sdk_pipe\""
   }
 
   otel_shutdown() {
@@ -66,7 +71,8 @@ else
       if \env --help 2>&1 | \grep -q 'ignore-signal'; then local extra_env_flags='--ignore-signal=INT --ignore-signal=HUP'; fi
       (\exec \env ${extra_env_flags:-} /opt/opentelemetry_shell/venv/bin/python /usr/share/opentelemetry_shell/sdk.py shell "$(_otel_package_version opentelemetry-shell)" <"$_otel_remote_sdk_pipe" 1>"$_otel_remote_sdk_stdout_redirect" 2>"$_otel_remote_sdk_stderr_redirect" &)
     fi
-    \eval "\\exec ${_otel_remote_sdk_fd}> \"$_otel_remote_sdk_pipe\""
+    \trap '' PIPE
+    \eval "\\exec ${_otel_remote_sdk_fd}<> \"$_otel_remote_sdk_pipe\""
     _otel_resource_attributes
     _otel_sdk_communicate "INIT"
   }
