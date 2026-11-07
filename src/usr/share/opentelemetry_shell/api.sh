@@ -48,16 +48,18 @@ unset OTEL_SHELL_SPAN_KIND_OVERRIDE
 if \[ -p "$_otel_remote_sdk_pipe" ]; then
   otel_init() {
     _otel_mkfifo_flags="-m 666"
-    # open the fifo read-write: a write-only open BLOCKS forever if the sdk
-    # reader died (kernel wait_for_partner — seen as 15min+ checkout hangs in
-    # CI). O_RDWR never blocks; a dead reader then surfaces as EPIPE/SIGPIPE
-    # on span writes, which we ignore so telemetry failure is fail-open.
+    # no persistent fd is held on the fifo: an fd opened here is inherited by
+    # EVERY child (dagger, tee, wc, …), and RDWR holders suppress the EOF that
+    # lets readers unwind when the writer side dies — the 2026-11-07 lint
+    # deadlock (dagger blocked in pipe_read on the inherited fd). Commands are
+    # sent through per-call open/write/close in _otel_sdk_communicate instead;
+    # an O_RDWR open never blocks and counts as a reader for itself, so early
+    # writes buffer in the fifo until the sdk connects.
     \trap '' PIPE
-    \eval "\\exec ${_otel_remote_sdk_fd}<> \"$_otel_remote_sdk_pipe\""
   }
 
   otel_shutdown() {
-    \eval "\\exec ${_otel_remote_sdk_fd}>&-"
+    \rm -f "$_otel_remote_sdk_pipe"
   }
 else
   otel_init() {
@@ -69,16 +71,14 @@ else
     else
       # several weird things going on in the next line, (1) using '((' fucks up the syntax highlighting in github while '( (' does not, and (2) &> causes weird buffering / late flushing behavior
       if \env --help 2>&1 | \grep -q 'ignore-signal'; then local extra_env_flags='--ignore-signal=INT --ignore-signal=HUP'; fi
-      (\exec \env ${extra_env_flags:-} /opt/opentelemetry_shell/venv/bin/python /usr/share/opentelemetry_shell/sdk.py shell "$(_otel_package_version opentelemetry-shell)" <"$_otel_remote_sdk_pipe" 1>"$_otel_remote_sdk_stdout_redirect" 2>"$_otel_remote_sdk_stderr_redirect" &)
+      (\exec \env ${extra_env_flags:-} /opt/opentelemetry_shell/venv/bin/python /usr/share/opentelemetry_shell/sdk.py shell "$(_otel_package_version opentelemetry-shell)" "$_otel_remote_sdk_pipe" <"$_otel_remote_sdk_pipe" 1>"$_otel_remote_sdk_stdout_redirect" 2>"$_otel_remote_sdk_stderr_redirect" &)
     fi
     \trap '' PIPE
-    \eval "\\exec ${_otel_remote_sdk_fd}<> \"$_otel_remote_sdk_pipe\""
     _otel_resource_attributes
     _otel_sdk_communicate "INIT"
   }
 
   otel_shutdown() {
-    \eval "\\exec ${_otel_remote_sdk_fd}>&-"
     \rm -f "$_otel_remote_sdk_pipe"
   }
 fi
@@ -89,7 +89,13 @@ _otel_sdk_communicate() {
     local IFS=' '
     _otel_sdk_communicate "$(\printf '%s' "$*" | \tr '\n' ' ')"
   else
-    \echo "$@" >&7
+    # per-call open/write/close on the fifo (see otel_init): an O_RDWR open
+    # never blocks and buffers the line even before the sdk connects; with no
+    # reader at all the write raises EPIPE which `trap '' PIPE` ignores —
+    # telemetry fails open, the command never waits on telemetry.
+    \eval "\\exec ${_otel_remote_sdk_fd}<> \"$_otel_remote_sdk_pipe\""
+    \echo "$@" >&${_otel_remote_sdk_fd}
+    \eval "\\exec ${_otel_remote_sdk_fd}>&- ${_otel_remote_sdk_fd}<&-"
   fi
 }
 

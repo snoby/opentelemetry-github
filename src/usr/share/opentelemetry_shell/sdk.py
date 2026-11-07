@@ -24,10 +24,34 @@ delayed_observations = {}
 auto_end = False
 
 def main():
-    run(sys.argv[1], sys.argv[2], sys.stdin)
+    fifo = sys.argv[3] if len(sys.argv) > 3 else None
+    run(sys.argv[1], sys.argv[2], sys.stdin, fifo)
 
-def run(scope, version, commands):
-    for line in commands:
+def run(scope, version, commands, fifo=None):
+    # Hold the fifo open O_RDWR as a keepalive: the shell now writes with
+    # per-call open/write/close (no persistent fd), so stdin would otherwise
+    # see EOF after every command and shut down early. Our own O_RDWR fd keeps
+    # the fifo alive; we exit when the shell unlinks the fifo (otel_shutdown),
+    # detected on a 5s select timeout — no orphaned sdk processes.
+    keepalive = None
+    if fifo:
+        try:
+            keepalive = os.open(fifo, os.O_RDWR)
+        except OSError:
+            keepalive = None
+    import select
+    while True:
+        if keepalive is not None:
+            if fifo is None or not os.path.exists(fifo):
+                break
+            ready, _, _ = select.select([commands], [], [], 5)
+            if not ready:
+                continue
+        line = commands.readline()
+        if len(line) == 0:
+            if keepalive is not None:
+                continue  # transient EOF between writers
+            break
         line = line.strip()
         if len(line) == 0:
             continue

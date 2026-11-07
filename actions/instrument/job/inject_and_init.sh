@@ -83,11 +83,13 @@ tmp_dir="$(mktemp -d)"
 chmod 777 "$tmp_dir"
 echo otel_shell_sdk_output_redirect="${OTEL_SHELL_SDK_OUTPUT_REDIRECT:-/dev/null}" >>"$GITHUB_STATE"
 export OTEL_SHELL_SDK_OUTPUT_REDIRECT="$(mktemp -u -p "$tmp_dir")"
-mkfifo "$OTEL_SHELL_SDK_OUTPUT_REDIRECT"
-chmod 777 "$OTEL_SHELL_SDK_OUTPUT_REDIRECT"
+# plain file, NOT a fifo: sdk.py must never block writing its own diagnostics
+# when a reader dies (a blocked sdk stops draining the command fifo, which
+# freezes every instrumented command — the 2026-11-07 lint deadlock).
+: > "$OTEL_SHELL_SDK_OUTPUT_REDIRECT"
+chmod 666 "$OTEL_SHELL_SDK_OUTPUT_REDIRECT"
 log_file="$(mktemp -u -p "$tmp_dir")"
 echo "log_file=$log_file" >>"$GITHUB_STATE"
-(while true; do cat "$OTEL_SHELL_SDK_OUTPUT_REDIRECT"; done >>"$log_file" 2>/dev/null &)
 echo "::endgroup::"
 
 echo "::group::Install Dependencies"
