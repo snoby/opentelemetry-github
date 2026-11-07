@@ -33,6 +33,12 @@ def run(scope, version, commands, fifo=None):
     # see EOF after every command and shut down early. Our own O_RDWR fd keeps
     # the fifo alive; we exit when the shell unlinks the fifo (otel_shutdown),
     # detected on a 5s select timeout — no orphaned sdk processes.
+    #
+    # We read the RAW fd with our own buffer: gating sys.stdin.readline()
+    # behind select() deadlocks when the shell bursts several commands before
+    # we read — readline() pulls them all into Python's buffer, then select()
+    # on the (now empty) fd times out forever while commands sit unprocessed
+    # (the 2026-11-07 pre-instrumentation hang, otel_counter_create pipes).
     keepalive = None
     if fifo:
         try:
@@ -40,37 +46,58 @@ def run(scope, version, commands, fifo=None):
         except OSError:
             keepalive = None
     import select
+    fd = commands.fileno() if hasattr(commands, 'fileno') else None
+    if fd is None:
+        keepalive = None  # no fd to select on: fall back to blocking reads
+    buf = b""
     while True:
-        if keepalive is not None:
+        if b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            _handle_line(scope, version, line)
+            continue
+        if fd is None:
+            line = commands.readline()
+            if len(line) == 0:
+                break
+            _handle_line(scope, version, line)
+            continue
+        ready, _, _ = select.select([fd], [], [], 5)
+        if not ready:
             if fifo is None or not os.path.exists(fifo):
                 break
-            ready, _, _ = select.select([commands], [], [], 5)
-            if not ready:
-                continue
-        line = commands.readline()
-        if len(line) == 0:
-            if keepalive is not None:
-                continue  # transient EOF between writers
-            break
-        line = line.strip()
-        if len(line) == 0:
             continue
-        tokens = line.split(' ', 1)
-        tokens = [token for token in tokens if token]
         try:
-            handle(scope, version, tokens[0], tokens[1] if len(tokens) > 1 else None)
-        except EOFError:
-            sys.exit(0)
-        except Exception:
-            print('SDK Error: ' + line, file=sys.stderr)
-            import traceback
-            traceback.print_exc()
+            chunk = os.read(fd, 65536)
+        except OSError:
+            chunk = b""
+        if len(chunk) == 0:
+            if fifo is None or not os.path.exists(fifo):
+                break
+            continue
+        buf += chunk
     try:
         handle(scope, version, 'SHUTDOWN', None)
     except EOFError:
         sys.exit(0)
     except Exception:
         pass
+
+def _handle_line(scope, version, line):
+    if isinstance(line, bytes):
+        line = line.decode(errors="replace")
+    line = line.strip()
+    if len(line) == 0:
+        return
+    tokens = line.split(' ', 1)
+    tokens = [token for token in tokens if token]
+    try:
+        handle(scope, version, tokens[0], tokens[1] if len(tokens) > 1 else None)
+    except EOFError:
+        sys.exit(0)
+    except Exception:
+        print('SDK Error: ' + line, file=sys.stderr)
+        import traceback
+        traceback.print_exc()
 
 def guess_cloud_resource_detectors():
     if os.environ.get('GITHUB_ACTIONS', 'false') == 'true' and os.environ.get('RUNNER_ENVIRONMENT', 'unknown') == 'github-hosted':
