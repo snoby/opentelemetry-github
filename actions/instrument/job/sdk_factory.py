@@ -26,5 +26,10 @@ while True:
       version = tokens[1]
       command_pipe = tokens[2]
       with open(command_pipe) as commands:
-        sdk.run(scope, version, commands)
+        # fork patch: pass the command fifo as the keepalive fifo. Without it
+        # children exit on the first 5s select timeout; any command the shell
+        # writes after that has NO reader and the shell blocks forever in
+        # open() (wait_for_partner). With it the child lives until the shell
+        # unlinks the fifo at session shutdown.
+        sdk.run(scope, version, commands, command_pipe)
         sys.exit(0)

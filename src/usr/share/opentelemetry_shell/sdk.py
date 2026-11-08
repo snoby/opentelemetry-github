@@ -82,6 +82,33 @@ def run(scope, version, commands, fifo=None):
     except Exception:
         pass
 
+def _reply(response_path, text):
+    # fork patch: reply via an O_RDWR open. A plain open(path, 'w') on a
+    # fifo BLOCKS until the shell's reader appears — if the reply is written
+    # before the shell reaches its read, or on any error path where the
+    # reader never comes, that open wedges the SDK and the shell hangs in
+    # wait_for_partner. O_RDWR never blocks on open.
+    fd = os.open(response_path, os.O_RDWR)
+    try:
+        os.write(fd, text.encode())
+    finally:
+        os.close(fd)
+
+def _always_reply(line):
+    # fork patch: if a response-carrying command crashed before replying,
+    # write an empty reply so the shell's bounded read unblocks (fail-open
+    # telemetry: a lost span must never hang a pipeline step). For every
+    # response-carrying command the response fifo path is the first token
+    # of the arguments.
+    try:
+        parts = line.split(' ', 1)
+        if len(parts) > 1 and parts[1]:
+            response_path = parts[1].split(' ', 1)[0]
+            if response_path.startswith('/'):
+                _reply(response_path, '')
+    except Exception:
+        pass
+
 def _handle_line(scope, version, line):
     if isinstance(line, bytes):
         line = line.decode(errors="replace")
@@ -98,6 +125,7 @@ def _handle_line(scope, version, line):
         print('SDK Error: ' + line, file=sys.stderr)
         import traceback
         traceback.print_exc()
+        _always_reply(line)
 
 def guess_cloud_resource_detectors():
     if os.environ.get('GITHUB_ACTIONS', 'false') == 'true' and os.environ.get('RUNNER_ENVIRONMENT', 'unknown') == 'github-hosted':
@@ -356,8 +384,7 @@ def handle(scope, version, command, arguments):
         next_span_id = next_span_id + 1
         span = get_tracer(scope, version).start_span(name, kind=SpanKind[kind.upper()], context=TraceContextTextMapPropagator().extract({'traceparent': traceparent, 'tracestate': tracestate}), start_time=parse_time(start_time))
         spans[str(span_id)] = span
-        with open(response_path, 'w') as response:
-            response.write(str(span_id))
+        _reply(response_path, str(span_id))
         auto_end = False
     elif command == 'SPAN_END':
         from opentelemetry.sdk.trace import Span
@@ -377,9 +404,9 @@ def handle(scope, version, command, arguments):
         context = get_current_span(TraceContextTextMapPropagator().extract({'traceparent': traceparent})).get_span_context()
         for span_id, span in spans.items():
             if span.context.span_id == context.span_id:
-                with open(response_path, 'w') as response:
-                    response.write(str(span_id))
-                    return
+                _reply(response_path, str(span_id))
+                return
+        _reply(response_path, '')
     elif command == 'SPAN_AUTO_END':
         auto_end = True
     elif command == 'SPAN_NAME':
@@ -413,19 +440,16 @@ def handle(scope, version, command, arguments):
         tokens = arguments.split(' ', 1)
         response_path = tokens[0]
         if len(tokens) == 1:
-            with open(response_path, 'w') as response:
-                response.write('')
-                return
+            _reply(response_path, '')
+            return
         span_id = tokens[1]
         if not span_id in spans:
-            with open(response_path, 'w') as response:
-                response.write('')
-                return
+            _reply(response_path, '')
+            return
         span : Span = spans[span_id]
         carrier = {}
         TraceContextTextMapPropagator().inject(carrier, set_span_in_context(span, None))
-        with open(response_path, 'w') as response:
-            response.write(carrier.get('traceparent', ''))
+        _reply(response_path, carrier.get('traceparent', ''))
     elif command == 'EVENT_CREATE':
         global next_event_id
         tokens = arguments.split(' ', 1)
@@ -434,8 +458,7 @@ def handle(scope, version, command, arguments):
         event_id = str(next_event_id)
         next_event_id = next_event_id + 1
         events[event_id] = { 'name': event_name, 'attributes': {} }
-        with open(response_path, 'w') as response:
-            response.write(event_id)
+        _reply(response_path, event_id)
     elif command == 'EVENT_ATTRIBUTE':
         tokens = arguments.split(' ', 2)
         event_id = tokens[0]
@@ -469,8 +492,7 @@ def handle(scope, version, command, arguments):
         link_id = str(next_link_id)
         next_link_id = next_link_id + 1
         links[link_id] = { 'context': link_context, 'attributes': {} }
-        with open(response_path, 'w') as response:
-            response.write(link_id)
+        _reply(response_path, link_id)
     elif command == 'LINK_ATTRIBUTE':
         tokens = arguments.split(' ', 2)
         link_id = tokens[0]
@@ -530,8 +552,7 @@ def handle(scope, version, command, arguments):
         else:
             raise Exception('Unknown counter type: ' + type)
         next_counter_id = next_counter_id + 1
-        with open(response_path, 'w') as response:
-            response.write(counter_id)
+        _reply(response_path, counter_id)
     elif command == 'COUNTER_OBSERVE':
         tokens = arguments.split(' ', 1)
         counter_id = tokens[0]
@@ -557,8 +578,7 @@ def handle(scope, version, command, arguments):
         observation_id = str(next_observation_id)
         next_observation_id = next_observation_id + 1
         observations[observation_id] = { 'amount': convert_type('auto', amount), 'attributes': {} }
-        with open(response_path, 'w') as response:
-            response.write(observation_id)
+        _reply(response_path, observation_id)
     elif command == 'OBSERVATION_ATTRIBUTE':
         tokens = arguments.split(' ', 2)
         observation_id = tokens[0]
