@@ -47,14 +47,20 @@ unset OTEL_SHELL_SPAN_KIND_OVERRIDE
 
 if \[ -p "$_otel_remote_sdk_pipe" ]; then
   otel_init() {
+    # holder: keep the shared factory pipe open for 30s so early writes
+    # buffer until the factory child opens its end — a per-call O_RDWR
+    # write/close with NO reader alive destroys its data (the fifo buffer
+    # dies with the last fd; the old "EPIPE" reasoning was wrong).
+    ( \exec 3<>"$_otel_remote_sdk_pipe"; \sleep 30 ) >/dev/null 2>&1 &
     _otel_mkfifo_flags="-m 666"
-    # no persistent fd is held on the fifo: an fd opened here is inherited by
-    # EVERY child (dagger, tee, wc, …), and RDWR holders suppress the EOF that
-    # lets readers unwind when the writer side dies — the 2026-11-07 lint
-    # deadlock (dagger blocked in pipe_read on the inherited fd). Commands are
-    # sent through per-call open/write/close in _otel_sdk_communicate instead;
-    # an O_RDWR open never blocks and counts as a reader for itself, so early
-    # writes buffer in the fifo until the sdk connects.
+    # no persistent fd is held on the fifo by the MAIN shell: an fd opened
+    # here is inherited by EVERY child (dagger, tee, wc, …), and RDWR
+    # holders in the main shell suppress the EOF that lets readers unwind
+    # when the writer side dies — the 2026-11-07 lint deadlock (dagger
+    # blocked in pipe_read on the inherited fd). Commands are sent through
+    # per-call open/write/close in _otel_sdk_communicate; early-write
+    # survival is provided by the holder above plus the factory child's
+    # own keepalive (sdk_factory passes the fifo to sdk.run).
     \trap '' PIPE
   }
 
@@ -66,6 +72,11 @@ else
     _otel_package_version opentelemetry-shell >/dev/null # to build the cache outside a subshell
     _otel_package_version "$_otel_shell" >/dev/null
     \mkfifo "$_otel_remote_sdk_pipe"
+    # holder: keep the command fifo open for 30s so early writes (INIT,
+    # RESOURCE_ATTRIBUTE, the first SPAN_START) buffer until the factory
+    # child opens its end — a per-call O_RDWR write/close with NO reader
+    # alive destroys its data (fifo buffer dies with the last fd).
+    ( \exec 3<>"$_otel_remote_sdk_pipe"; \sleep 30 ) >/dev/null 2>&1 &
     if \[ -n "${USER:-}" ] && \[ -p /tmp/otel_shell/sdk_factory."$USER".pipe ] && \[ "${OTEL_LOGS_EXPORTER:-otlp}" != console ] && \[ "${OTEL_METRICS_EXPORTER:-otlp}" != console ] && \[ "${OTEL_TRACES_EXPORTER:-otlp}" != console ]; then
       \echo shell "$(_otel_package_version opentelemetry-shell)" "$_otel_remote_sdk_pipe" >>/tmp/otel_shell/sdk_factory."$USER".pipe
     else
@@ -90,9 +101,10 @@ _otel_sdk_communicate() {
     _otel_sdk_communicate "$(\printf '%s' "$*" | \tr '\n' ' ')"
   else
     # per-call open/write/close on the fifo (see otel_init): an O_RDWR open
-    # never blocks and buffers the line even before the sdk connects; with no
-    # reader at all the write raises EPIPE which `trap '' PIPE` ignores —
-    # telemetry fails open, the command never waits on telemetry.
+    # never blocks; WARNING — if no reader is alive, the buffered data is
+    # destroyed on close (fifo buffer dies with the last fd), NOT surfaced
+    # as EPIPE. Early-write survival comes from the otel_init holder and
+    # the factory child's keepalive; telemetry fails open regardless.
     \eval "\\exec ${_otel_remote_sdk_fd}<> \"$_otel_remote_sdk_pipe\""
     \echo "$@" >&${_otel_remote_sdk_fd}
     \eval "\\exec ${_otel_remote_sdk_fd}>&- ${_otel_remote_sdk_fd}<&-"
@@ -203,9 +215,16 @@ _otel_resolve_package_version() {
 otel_span_current() {
   local response_pipe="$(\mktemp -u -p "$_otel_shell_pipe_dir" opentelemetry_shell.$$.span_handle.pipe.XXXXXXXXXX)"
   \mkfifo ${_otel_mkfifo_flags:-} "$response_pipe"
+  # hold the response fifo open BEFORE sending the request: a reply written
+  # when no reader has ever opened the fifo is DESTROYED when the writer
+  # closes (a fifo buffer dies with its last fd), which would leave the
+  # shell blocked in open() forever — a state read -t 10 cannot rescue.
+  # An O_RDWR open never blocks and guarantees the reader side exists.
+  \exec 9<>"$response_pipe"
   _otel_sdk_communicate "SPAN_HANDLE" "$response_pipe" "${TRACEPARENT:-}"
   local handle
-  \read -t 10 handle <"$response_pipe" || \true
+  \read -t 10 handle <&9 || \true
+  \exec 9<&- || \true
   \echo "$handle"
   \rm "$response_pipe" 1>/dev/null 2>/dev/null
 }
@@ -219,9 +238,16 @@ otel_span_start() {
   local name="$2"
   local response_pipe="$(\mktemp -u -p "$_otel_shell_pipe_dir" opentelemetry_shell.$$.span_handle.pipe.XXXXXXXXXX)"
   \mkfifo ${_otel_mkfifo_flags:-} "$response_pipe"
+  # hold the response fifo open BEFORE sending the request: a reply written
+  # when no reader has ever opened the fifo is DESTROYED when the writer
+  # closes (a fifo buffer dies with its last fd), which would leave the
+  # shell blocked in open() forever — a state read -t 10 cannot rescue.
+  # An O_RDWR open never blocks and guarantees the reader side exists.
+  \exec 9<>"$response_pipe"
   _otel_sdk_communicate "SPAN_START" "$response_pipe" "${TRACEPARENT:-}" "${TRACESTATE:-}" "$time" "$kind" "$name"
   local handle
-  \read -t 10 handle <"$response_pipe" || \true
+  \read -t 10 handle <&9 || \true
+  \exec 9<&- || \true
   \echo "$handle"
   \rm "$response_pipe" 1>/dev/null 2>/dev/null
 }
@@ -260,9 +286,16 @@ otel_span_traceparent() {
   local span_handle="$1"
   local response_pipe="$(\mktemp -u -p "$_otel_shell_pipe_dir" opentelemetry_shell.$$.traceparent.pipe.XXXXXXXXXX)"
   \mkfifo ${_otel_mkfifo_flags:-} "$response_pipe"
+  # hold the response fifo open BEFORE sending the request: a reply written
+  # when no reader has ever opened the fifo is DESTROYED when the writer
+  # closes (a fifo buffer dies with its last fd), which would leave the
+  # shell blocked in open() forever — a state read -t 10 cannot rescue.
+  # An O_RDWR open never blocks and guarantees the reader side exists.
+  \exec 9<>"$response_pipe"
   _otel_sdk_communicate "SPAN_TRACEPARENT" "$response_pipe" "$span_handle"
   local traceparent
-  \read -t 10 traceparent <"$response_pipe" || \true
+  \read -t 10 traceparent <&9 || \true
+  \exec 9<&- || \true
   \echo "$traceparent"
   \rm "$response_pipe" 1>/dev/null 2>/dev/null
 }
@@ -294,9 +327,16 @@ otel_event_create() {
   local event_name="$1"
   local response_pipe="$(\mktemp -u -p "$_otel_shell_pipe_dir" opentelemetry_shell.$$.event_handle.pipe.XXXXXXXXXX)"
   \mkfifo ${_otel_mkfifo_flags:-} "$response_pipe"
+  # hold the response fifo open BEFORE sending the request: a reply written
+  # when no reader has ever opened the fifo is DESTROYED when the writer
+  # closes (a fifo buffer dies with its last fd), which would leave the
+  # shell blocked in open() forever — a state read -t 10 cannot rescue.
+  # An O_RDWR open never blocks and guarantees the reader side exists.
+  \exec 9<>"$response_pipe"
   _otel_sdk_communicate "EVENT_CREATE" "$response_pipe" "$event_name"
   local handle
-  \read -t 10 handle <"$response_pipe" || \true
+  \read -t 10 handle <&9 || \true
+  \exec 9<&- || \true
   \echo "$handle"
   \rm "$response_pipe" 1>/dev/null 2>/dev/null
 }
@@ -325,9 +365,16 @@ otel_link_create() {
   local tracestate="$2"
   local response_pipe="$(\mktemp -u -p "$_otel_shell_pipe_dir" opentelemetry_shell.$$.link_handle.pipe.XXXXXXXXXX)"
   \mkfifo ${_otel_mkfifo_flags:-} "$response_pipe"
+  # hold the response fifo open BEFORE sending the request: a reply written
+  # when no reader has ever opened the fifo is DESTROYED when the writer
+  # closes (a fifo buffer dies with its last fd), which would leave the
+  # shell blocked in open() forever — a state read -t 10 cannot rescue.
+  # An O_RDWR open never blocks and guarantees the reader side exists.
+  \exec 9<>"$response_pipe"
   _otel_sdk_communicate "LINK_CREATE" "$response_pipe" "$traceparent" "$tracestate" END
   local handle
-  \read -t 10 handle <"$response_pipe" || \true
+  \read -t 10 handle <&9 || \true
+  \exec 9<&- || \true
   \echo "$handle"
   \rm "$response_pipe" 1>/dev/null 2>/dev/null
 }
@@ -357,6 +404,12 @@ otel_counter_create() {
   local unit="${3:-1}"
   local response_pipe="$(\mktemp -u -p "$_otel_shell_pipe_dir" opentelemetry_shell.$$.counter_handle.pipe.XXXXXXXXXX)"
   \mkfifo ${_otel_mkfifo_flags:-} "$response_pipe"
+  # hold the response fifo open BEFORE sending the request: a reply written
+  # when no reader has ever opened the fifo is DESTROYED when the writer
+  # closes (a fifo buffer dies with its last fd), which would leave the
+  # shell blocked in open() forever — a state read -t 10 cannot rescue.
+  # An O_RDWR open never blocks and guarantees the reader side exists.
+  \exec 9<>"$response_pipe"
   if \[ "$type" = histogram ]; then
     local buckets="${4:-}"
     local description="${5:-}"
@@ -366,7 +419,8 @@ otel_counter_create() {
     _otel_sdk_communicate "COUNTER_CREATE" "$response_pipe" "$type" "$name" "$unit" "$description"
   fi
   local handle
-  \read -t 10 handle <"$response_pipe" || \true
+  \read -t 10 handle <&9 || \true
+  \exec 9<&- || \true
   \echo "$handle"
   \rm "$response_pipe" 1>/dev/null 2>/dev/null
 }
@@ -381,9 +435,16 @@ otel_observation_create() {
   local value="$1"
   local response_pipe="$(\mktemp -u -p "$_otel_shell_pipe_dir")_opentelemetry_shell_$$.observation_handle.pipe"
   \mkfifo ${_otel_mkfifo_flags:-} "$response_pipe"
+  # hold the response fifo open BEFORE sending the request: a reply written
+  # when no reader has ever opened the fifo is DESTROYED when the writer
+  # closes (a fifo buffer dies with its last fd), which would leave the
+  # shell blocked in open() forever — a state read -t 10 cannot rescue.
+  # An O_RDWR open never blocks and guarantees the reader side exists.
+  \exec 9<>"$response_pipe"
   _otel_sdk_communicate "OBSERVATION_CREATE" "$response_pipe" "$value"
   local handle
-  \read -t 10 handle <"$response_pipe" || \true
+  \read -t 10 handle <&9 || \true
+  \exec 9<&- || \true
   \echo "$handle"
   \rm "$response_pipe" 1>/dev/null 2>/dev/null
 }

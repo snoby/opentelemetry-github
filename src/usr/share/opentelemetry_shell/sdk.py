@@ -63,7 +63,10 @@ def run(scope, version, commands, fifo=None):
             continue
         ready, _, _ = select.select([fd], [], [], 5)
         if not ready:
-            if fifo is None or not os.path.exists(fifo):
+            # exit when the shell unlinks the fifo (otel_shutdown) OR when
+            # the shell process itself is gone (its pid is embedded in the
+            # fifo name) — otherwise a SIGKILLed/cancelled shell orphans us.
+            if fifo is None or not os.path.exists(fifo) or not _shell_alive(fifo):
                 break
             continue
         try:
@@ -71,7 +74,7 @@ def run(scope, version, commands, fifo=None):
         except OSError:
             chunk = b""
         if len(chunk) == 0:
-            if fifo is None or not os.path.exists(fifo):
+            if fifo is None or not os.path.exists(fifo) or not _shell_alive(fifo):
                 break
             continue
         buf += chunk
@@ -88,9 +91,12 @@ def _reply(response_path, text):
     # before the shell reaches its read, or on any error path where the
     # reader never comes, that open wedges the SDK and the shell hangs in
     # wait_for_partner. O_RDWR never blocks on open.
+    # The reply is newline-terminated because the shell now reads from a
+    # pre-opened O_RDWR fd (api.sh exec 9<>): no writer-side EOF ever
+    # arrives, so read returns on the complete line only.
     fd = os.open(response_path, os.O_RDWR)
     try:
-        os.write(fd, text.encode())
+        os.write(fd, (text + '\n').encode())
     finally:
         os.close(fd)
 
@@ -126,6 +132,17 @@ def _handle_line(scope, version, line):
         import traceback
         traceback.print_exc()
         _always_reply(line)
+
+def _shell_alive(fifo):
+    # fifo names embed the owning shell's pid:
+    # opentelemetry_shell.<pid>.sdk.pipe.<suffix> (standalone) or
+    # opentelemetry_shell.<pid>.<...> (factory command pipes)
+    try:
+        pid = os.path.basename(fifo).split('.')[1]
+        os.kill(int(pid), 0)
+        return True
+    except (ValueError, IndexError, ProcessLookupError, PermissionError, OSError):
+        return False
 
 def guess_cloud_resource_detectors():
     if os.environ.get('GITHUB_ACTIONS', 'false') == 'true' and os.environ.get('RUNNER_ENVIRONMENT', 'unknown') == 'github-hosted':
